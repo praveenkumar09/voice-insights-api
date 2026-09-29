@@ -1,7 +1,10 @@
 package com.aia.voiceinsights.api.voice;
 
 import com.aia.voiceinsights.api.model.CustomerProfile;
+import com.aia.voiceinsights.api.model.CopilotInsights;
+import com.aia.voiceinsights.api.model.LiveInsightsSnapshot;
 import com.aia.voiceinsights.api.service.CustomerProfileStore;
+import com.aia.voiceinsights.api.service.LiveCopilotService;
 import com.aia.voiceinsights.api.service.ProfileExtractionService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -13,6 +16,8 @@ import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.AbstractWebSocketHandler;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -55,6 +60,7 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
 
     private final CustomerProfileStore profileStore;
     private final ProfileExtractionService extractionService;
+    private final LiveCopilotService copilotService;
     // findAndRegisterModules() picks up JSR-310 support (java.time.Instant) —
     // without it, serializing CustomerProfile (createdAt/updatedAt) throws,
     // and sendJsonQuiet's catch-all silently drops every "profile" message.
@@ -75,9 +81,11 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
     @Value("${OPENAI_API_KEY:}")
     private String openaiApiKey;
 
-    public VoiceWebSocketHandler(CustomerProfileStore profileStore, ProfileExtractionService extractionService) {
+    public VoiceWebSocketHandler(CustomerProfileStore profileStore, ProfileExtractionService extractionService,
+                                 LiveCopilotService copilotService) {
         this.profileStore = profileStore;
         this.extractionService = extractionService;
+        this.copilotService = copilotService;
     }
 
     @Override
@@ -110,6 +118,7 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
                         vs.transcript.append(text).append(" ");
                         sendJsonQuiet(wsSession, Map.of("type", "final_transcript", "text", text));
                         extractionExecutor.submit(() -> reExtractAndPush(wsSession, vs));
+                        extractionExecutor.submit(() -> pushCopilot(wsSession, vs));
                     }
 
                     @Override
@@ -181,6 +190,9 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
         try { Thread.sleep(1500); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
 
         extractionService.extractInto(vs.profile, vs.transcript.toString());
+        // Last live pass over the complete transcript, so the snapshot handed to the analysis
+        // stage (and the live-vs-final comparison) is the best the live layer can produce.
+        analyseAndRecord(vs);
         vs.profile.setRawTranscript(vs.transcript.toString());
         vs.profile.setStatus("FINALIZED");
         profileStore.save(vs.profile);
@@ -201,6 +213,39 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
         sendJsonQuiet(wsSession, Map.of("type", "profile", "profile", vs.profile));
     }
 
+    /**
+     * Runs the live copilot analysis. Only one analysis runs per session at a
+     * time; segments that finalize meanwhile just set {@code copilotDirty}, so
+     * the loop re-runs once on the newest transcript instead of queueing a
+     * stale run per segment.
+     */
+    private void pushCopilot(WebSocketSession wsSession, VoiceSession vs) {
+        vs.copilotDirty = true;
+        if (!vs.copilotRunning.compareAndSet(false, true)) return;
+        try {
+            while (vs.copilotDirty && wsSession.isOpen()) {
+                vs.copilotDirty = false;
+                CopilotInsights insights = analyseAndRecord(vs);
+                if (insights != null) sendJsonQuiet(wsSession, Map.of("type", "copilot", "copilot", insights));
+            }
+        } finally {
+            vs.copilotRunning.set(false);
+        }
+    }
+
+    /** One copilot pass, serialized per session, that also keeps the profile's live snapshot up to date. */
+    private CopilotInsights analyseAndRecord(VoiceSession vs) {
+        synchronized (vs.copilotState) {
+            CopilotInsights insights = copilotService.analyse(vs.profile, vs.transcript.toString(), vs.copilotState);
+            if (insights != null) {
+                vs.signalHistory.add(new LiveInsightsSnapshot.SignalPoint(
+                        insights.sentiment().score(), insights.buyingSignal().score()));
+                vs.profile.setLiveInsights(new LiveInsightsSnapshot(insights, List.copyOf(vs.signalHistory)));
+            }
+            return insights;
+        }
+    }
+
     private void sendJsonQuiet(WebSocketSession session, Object payload) {
         try {
             synchronized (session) {
@@ -219,6 +264,10 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
         volatile OpenAiRealtimeTranscriptionClient transcriptionClient;
         volatile boolean intentionalClose = false;
         volatile int reconnectAttempts = 0;
+        volatile boolean copilotDirty = false;
+        final LiveCopilotService.State copilotState = new LiveCopilotService.State();
+        final List<LiveInsightsSnapshot.SignalPoint> signalHistory = new ArrayList<>();
+        final java.util.concurrent.atomic.AtomicBoolean copilotRunning = new java.util.concurrent.atomic.AtomicBoolean(false);
         final StringBuilder transcript = new StringBuilder();
 
         VoiceSession(CustomerProfile profile) {

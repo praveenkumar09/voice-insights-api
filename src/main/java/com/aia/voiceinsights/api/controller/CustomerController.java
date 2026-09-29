@@ -31,6 +31,9 @@ public class CustomerController {
     public ResponseEntity<CustomerProfile> upsert(@RequestBody CustomerProfile profile,
                                                     @RequestHeader(value = "X-Session-Token", required = false) String token) {
         authStore.resolveUserId(token).ifPresent(profile::setAgentUserId);
+        // Live insights are produced by the voice session, not by clients — always keep the stored copy.
+        profile.setLiveInsights(profile.getId() == null ? null
+                : profileStore.findById(profile.getId()).map(CustomerProfile::getLiveInsights).orElse(null));
         if (profile.getStatus() == null || profile.getStatus().isBlank()) {
             profile.setStatus("FINALIZED");
         }

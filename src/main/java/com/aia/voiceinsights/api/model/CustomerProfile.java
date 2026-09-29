@@ -29,6 +29,9 @@ public class CustomerProfile {
 
     private String rawTranscript;
 
+    /** Set server-side by the voice session only — never trusted from a client write (see CustomerController). */
+    private LiveInsightsSnapshot liveInsights;
+
     private Instant createdAt;
     private Instant updatedAt;
 
@@ -69,6 +72,8 @@ public class CustomerProfile {
     public void setNotes(String notes) { this.notes = notes; }
 
     public String getRawTranscript() { return rawTranscript; }
+    public LiveInsightsSnapshot getLiveInsights() { return liveInsights; }
+    public void setLiveInsights(LiveInsightsSnapshot liveInsights) { this.liveInsights = liveInsights; }
     public void setRawTranscript(String rawTranscript) { this.rawTranscript = rawTranscript; }
 
     public Instant getCreatedAt() { return createdAt; }

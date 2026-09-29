@@ -93,7 +93,7 @@ public class RecommendationAgentService {
 
     // ── 1. Need Agent — "What is the customer looking for?" ────────────────
 
-    private static final String NEED_SYSTEM_PROMPT = """
+    private static final String NEED_SYSTEM_PROMPT = ("""
             You are the Need Agent in AIA Singapore's voice-driven insurance
             recommendation engine. Purpose: determine the customer's intentions —
             what are they actually looking for, in their own words and context. You
@@ -108,11 +108,11 @@ public class RecommendationAgentService {
             Respond with ONLY a JSON object, no markdown fences, no commentary:
             {
               "protectionGaps": ["short phrase per gap identified"],
-              "recommendedCategories": ["e.g. Term Life Protection", "Critical Illness"],
+              "recommendedCategories": ["each MUST start with one of the standard need categories (%s), optionally followed by ' – ' and the product type, e.g. 'Family protection – Term Life'"],
               "matchedProductNames": ["product names pulled from the candidate excerpts that address the gaps"],
               "rationale": "2-4 sentences explaining the reasoning, referencing specific profile facts"
             }
-            """;
+            """).formatted(NeedTaxonomy.asPromptList());
 
     public NeedAnalysisResult analyzeNeed(CustomerProfile profile) {
         List<ProductChunkMatch> candidates = productSearch.search(profileSearchQuery(profile));
@@ -211,6 +211,11 @@ public class RecommendationAgentService {
             Young Professional, Newly Married, Growing Family, Established Family,
             Pre-Retirement, Retiree, Business Owner.
 
+            You may also be given "Conversation signals" (customer sentiment and
+            buying-signal trend measured live during the call). Treat them as
+            supporting context about tone and readiness only — never let them
+            override the profile or the analysis facts.
+
             Respond with ONLY a JSON object, no markdown fences, no commentary:
             {
               "personaLabel": "short persona name, e.g. 'Growing Family Protector'",
@@ -223,6 +228,7 @@ public class RecommendationAgentService {
     public CustomerPersonaResult buildPersona(CustomerProfile profile, MergedInsights merged) {
         try {
             String userMessage = "Customer profile:\n" + profileSummary(profile)
+                    + signalsBlock(profile)
                     + "\n\nMerged analysis: " + mapper.writeValueAsString(merged);
             return call(PERSONA_SYSTEM_PROMPT, userMessage, CustomerPersonaResult.class);
         } catch (Exception e) {
@@ -417,6 +423,11 @@ public class RecommendationAgentService {
             before proceeding. If compliant is true, write a confident, plain
             pitch as normal.
 
+            You may also be given "Conversation signals" (sentiment and
+            buying-signal trend measured live during the call). Use them only to
+            tune tone and pacing (e.g. reassure a hesitant customer, move faster
+            with an eager one) — never to change what is recommended.
+
             Respond with ONLY a JSON object, no markdown fences, no commentary:
             {
               "customerFacingSummary": "2-4 sentences, plain language, no insurance jargon, as if speaking to the customer",
@@ -429,6 +440,7 @@ public class RecommendationAgentService {
                                                   ComplianceCheckResult compliance) {
         try {
             String userMessage = "Customer profile:\n" + profileSummary(profile)
+                    + signalsBlock(profile)
                     + "\n\nMerged analysis: " + mapper.writeValueAsString(merged)
                     + "\n\nShortlisted products: " + mapper.writeValueAsString(shortlist)
                     + "\n\nEvidence validation: " + mapper.writeValueAsString(validation)
@@ -467,6 +479,17 @@ public class RecommendationAgentService {
         md.append("- **Occupation:** ").append(nullToUnknown(profile.getOccupation())).append("\n");
         md.append("- **Dependents:** ").append(profile.getDependents() == null ? "Unknown" : profile.getDependents()).append("\n");
         md.append("- **Persona:** ").append(persona.personaLabel()).append(" (").append(persona.lifeStage()).append(")\n\n");
+
+        LiveInsightsSnapshot live = profile.getLiveInsights();
+        if (live != null && live.latest() != null) {
+            var sentiment = live.latest().sentiment();
+            var buying = live.latest().buyingSignal();
+            md.append("## Conversation Signals\n");
+            md.append("- **Sentiment at end of call:** ").append(sentiment.label()).append(" (").append(sentiment.emotion()).append(")\n");
+            md.append("- **Buying signal:** ").append(buying.level()).append(" — ").append(buying.score()).append("/100\n");
+            for (String t : buying.signals()) md.append("  - ").append(t).append("\n");
+            md.append("\n");
+        }
 
         md.append("## Executive Summary\n").append(summary.customerFacingSummary()).append("\n\n");
 
@@ -510,6 +533,16 @@ public class RecommendationAgentService {
         if (!compliance.issues().isEmpty()) {
             md.append("\n**Issues to resolve before proceeding:**\n");
             for (String issue : compliance.issues()) md.append("- ").append(issue).append("\n");
+        }
+
+        if (live != null && live.latest() != null && !live.latest().complianceFlags().isEmpty()) {
+            md.append("\n## Advisor Conduct Flags (live monitoring — for review)\n");
+            md.append("*Raised automatically during the conversation. Reported for advisor and compliance review; ")
+                    .append("they did not change the recommendation above.*\n\n");
+            for (var f : live.latest().complianceFlags()) {
+                md.append("- **").append("high".equals(f.severity()) ? "High risk" : "Caution").append(":** “")
+                        .append(f.statement()).append("” — ").append(f.advice()).append("\n");
+            }
         }
 
         String title = "Advisory Sales Report — " + nullToUnknown(profile.getCustomerName());
@@ -572,6 +605,32 @@ public class RecommendationAgentService {
         if (profile.getNotes() != null) sb.append(profile.getNotes());
         String query = sb.toString().trim();
         return query.isBlank() ? "life insurance protection needs" : query;
+    }
+
+    // ── Live conversation signals (from the voice-session copilot) ─────────
+
+    /**
+     * Sentiment + buying-signal trend measured live during the call, as
+     * supporting context for the Persona and Summary agents ONLY. Live needs,
+     * product matches and fit scores are deliberately NOT passed on — the
+     * agents must reach their own conclusions independently, not anchor on a
+     * cheap first impression. Conduct flags are also excluded: they are
+     * report-only (see the sales report) and never influence the analysis.
+     */
+    private String signalsBlock(CustomerProfile profile) {
+        LiveInsightsSnapshot live = profile.getLiveInsights();
+        if (live == null || live.latest() == null || live.history() == null || live.history().isEmpty()) return "";
+        var h = live.history();
+        int first = h.get(0).sentiment(), last = h.get(h.size() - 1).sentiment();
+        int min = h.stream().mapToInt(LiveInsightsSnapshot.SignalPoint::sentiment).min().orElse(last);
+        int max = h.stream().mapToInt(LiveInsightsSnapshot.SignalPoint::sentiment).max().orElse(last);
+        var latest = live.latest();
+        return "\n\nConversation signals (measured live, supporting context only):\n"
+                + "- Sentiment trend (-100..100): started " + first + ", low " + min + ", high " + max + ", ended " + last
+                + " (" + latest.sentiment().label() + ", " + latest.sentiment().emotion() + ")\n"
+                + "- Buying signal at end of call: " + latest.buyingSignal().level() + " (" + latest.buyingSignal().score() + "/100)"
+                + (latest.buyingSignal().signals().isEmpty() ? "" : "; triggers: " + String.join("; ", latest.buyingSignal().signals()))
+                + "\n";
     }
 
     private String profileSummary(CustomerProfile profile) {
