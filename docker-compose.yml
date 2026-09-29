@@ -1,0 +1,65 @@
+# Postgres is owned by cobol-ingestor-api/docker-compose.yml on the
+# `cobalt-shared` network (bring that stack up first: `cd
+# ../cobol-ingestor-api && docker compose up -d postgres`) — this service
+# connects to it as a client (env vars below), writing only to its own
+# `voice_insights` schema (self-provisioned on first boot — see AuthStore,
+# CustomerProfileStore, RecommendationStore). Redis below is this service's
+# own instance, not shared with cobalt-rag-api's.
+networks:
+  cobalt-shared:
+    external: true
+
+services:
+
+  # ── AIA Voice Insights API ───────────────────────────────────────────────────
+  voice-insights-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: voice_insights_api
+    ports:
+      - "8084:8084"
+    networks:
+      - default
+      - cobalt-shared
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/ingestor
+      SPRING_DATASOURCE_USERNAME: admin
+      SPRING_DATASOURCE_PASSWORD: admin
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      JAVA_TOOL_OPTIONS: "-Xms256m -Xmx1g"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8084/actuator/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # ── Redis ─────────────────────────────────────────────────────────────────────
+  # Session cache-aside only (see AuthStore) — Postgres stays the source of
+  # truth, so a lost volume just means a cold cache next boot.
+  redis:
+    image: redis:7-alpine
+    container_name: voice_insights_redis
+    command: >
+      redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+    networks:
+      - default
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+volumes:
+  redis_data:
